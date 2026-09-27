@@ -1,0 +1,14 @@
+# NIKKE 装备优化规划器 — 运行依赖
+#
+# Python >= 3.10：代码里用了 `str | None` 这类**运行期求值**的联合类型注解，
+# 3.9 及以下会直接 TypeError（不是静态检查问题，是 import 时就炸）。
+
+streamlit>=1.35.0
+# GUI。1.35 起 st.dataframe 支持行点选（点行展开角色详情）；
+# 更低版本不会报错，会自动退化成下拉框（见 app.py 的 _supports_row_selection）。
+
+pandas>=2.0.0
+# 表格渲染与 CSV 导出。
+#
+# 没有 requests：引擎只读随仓库分发的静态 JSON 快照，运行时不访问网络。
+# 数据采集与解析工具不入库，也就不在本文件里声明依赖。
