@@ -627,6 +627,173 @@ def test_history_manager():
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def test_history_snapshot_roundtrip():
+    """
+    历史记录的自包含快照：存一份 → 读回来 → 角色榜必须**逐行一模一样**。
+
+    钉的是回放的保真度。名册装备、该模式的目标、primary 门禁，三者少一样、
+    或拿**当前**的目标表去配旧名册，都不会报错 —— 只会让读回的角色榜悄悄变样：
+    排序换了、毕业进度归零、⏸ 标记消失，界面上看不出任何异常。
+    所以这里不比「差不多」，比的是 `records` 全等。
+
+    用 input/cn_collect.sample.json（入库的样例名册），谁都能跑。
+    """
+    import os
+    import shutil
+    import tempfile
+    from engine.bidding_engine import (
+        GlobalBiddingEngine, build_character_ladder, character_rows_to_records)
+    from engine.roster_loader import load_roster_with_targets
+    from models.targets import PARSED_PATH, load_targets_from_snapshot, snapshot_targets
+    import history_manager as hm
+
+    repo = Path(__file__).resolve().parent.parent
+    roster_path = str(repo / "input" / "cn_collect.sample.json")
+
+    for mode in ("PVE", "PVP"):
+        # ── 跑一次真实计算 ──
+        r = load_roster_with_targets(roster_path, PARSED_PATH, mode=mode)
+        engine = GlobalBiddingEngine(stones_held=300, credits_held=5_000_000)
+        bids = engine.run(r.characters)
+        assert bids, f"{mode}: 引擎没有产出任何竞价"
+
+        tmp = tempfile.mkdtemp()
+        old_dir = hm.HISTORY_DIR
+        hm.HISTORY_DIR = tmp
+        try:
+            path = hm.save_history(
+                bids, 300, 5_000_000, len(r.characters),
+                mode=mode,
+                roster=r.characters,
+                targets=snapshot_targets([c.name for c in r.characters], mode),
+                unmet_primary=engine.unmet_primary,
+            )
+            data = hm.load_history(path)
+            size_kb = os.path.getsize(path) / 1024
+            snap = hm.read_snapshot(data)
+
+            # 旧格式（不带快照）必须读成 None，而不是拼一张空名册出来
+            legacy = dict(data)
+            for key in ("roster", "targets", "unmet_primary", "mode"):
+                legacy.pop(key)
+            assert hm.read_snapshot(legacy) is None, "旧格式记录应返回 None"
+
+            # 有快照但缺目标切片 → 抛错。降级会显示成「所有角色已毕业」
+            broken = dict(data)
+            broken["targets"] = {}
+            try:
+                hm.read_snapshot(broken)
+                raise AssertionError("缺目标切片时应当抛错，不能静默重建")
+            except ValueError:
+                pass
+        finally:
+            hm.HISTORY_DIR = old_dir
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        assert snap is not None, f"{mode}: 快照读不出来"
+        assert snap.mode == mode
+        assert snap.unmatched_targets == r.unmatched_targets, snap.unmatched_targets
+        assert snap.unmet_primary == engine.unmet_primary, "门禁结果没跟着走"
+
+        # ── 名册：装备 + 目标逐项一致 ──
+        assert [c.name for c in snap.characters] == [c.name for c in r.characters]
+        for before, after in zip(r.characters, snap.characters):
+            assert after.gears == before.gears, f"{after.name} 的装备读回后变了"
+            assert after.targets == before.targets, f"{after.name} 的目标读回后变了"
+
+        # ── 角色榜：逐行全等（这才是「能回放」的定义）──
+        rows_before = character_rows_to_records(
+            build_character_ladder(r.characters, bids, engine.unmet_primary))
+        rows_after = character_rows_to_records(
+            build_character_ladder(snap.characters, bids, snap.unmet_primary))
+        assert rows_before, f"{mode}: 原榜是空的，这条断言失去意义"
+        assert rows_after == rows_before, [
+            (a["角色"], b["角色"]) for a, b in zip(rows_before, rows_after)
+            if a != b][:5]
+
+        # ── 目标切片读错模式要抛错，不能拿另一套目标凑合 ──
+        other = "PVP" if mode == "PVE" else "PVE"
+        try:
+            load_targets_from_snapshot(data["targets"], other)
+            raise AssertionError(f"用 {other} 读 {mode} 的切片应当抛错")
+        except ValueError:
+            pass
+
+        print(f"历史快照({mode}): {len(snap.characters)} 角色 | 角色榜 "
+              f"{len(rows_after)} 行逐行一致 | 文件 {size_kb:.0f}KB")
+
+
+def test_history_replay_resolution():
+    """
+    加载历史时「角色榜拿哪份名册」的判定 —— 真值表。
+
+    R1a 的错配与 R1b 的重建都走这一个岔路口，选错了不会报错，只会渲染出
+    一张看着正常、实际错配的表。所以每个岔口都钉一遍。
+    """
+    from engine.roster_loader import load_roster_with_targets
+    from models.targets import PARSED_PATH, snapshot_targets
+    import history_manager as hm
+
+    repo = Path(__file__).resolve().parent.parent
+    r = load_roster_with_targets(str(repo / "input" / "cn_collect.sample.json"),
+                                 PARSED_PATH, mode="PVE")
+    snap_roster = r.characters
+    snap_targets = snapshot_targets([c.name for c in r.characters], "PVE")
+    unmet = {"皇冠": ["最大装弹数增加 0/2"]}
+
+    new_record = {"roster": [c.to_dict() for c in snap_roster],
+                  "targets": snap_targets, "mode": "PVE", "unmet_primary": unmet}
+    legacy_record = {"bids": [], "stones": 1, "credits": 2}
+
+    # 1. 自包含记录：不看任何会话状态，冷启动也能重建
+    got = hm.resolve_replay(new_record)
+    assert got.kind == hm.KIND_SNAPSHOT
+    assert [c.name for c in got.characters] == [c.name for c in snap_roster]
+    assert got.unmet_primary == unmet and got.mode == "PVE" and not got.error
+
+    # 2. 记录损坏（缺目标切片）：报错，不凑合出一张错的榜
+    broken = dict(new_record, targets={})
+    got = hm.resolve_replay(broken)
+    assert got.kind == hm.KIND_BROKEN and got.characters is None and got.error
+
+    # 3. 旧记录 + 与上一轮同源（路径相同）→ 借用会话里的名册
+    got = hm.resolve_replay(legacy_record, history_path="h/a.json",
+                            last_run_path="h/a.json",
+                            last_run_characters=snap_roster,
+                            last_run_unmet_primary=unmet)
+    assert got.kind == hm.KIND_BORROWED
+    assert got.characters is snap_roster and got.unmet_primary is unmet
+
+    # 4. 旧记录 + 路径不同 → 什么都不给（这就是 R1a 防的那种错配）
+    got = hm.resolve_replay(legacy_record, history_path="h/a.json",
+                            last_run_path="h/b.json",
+                            last_run_characters=snap_roster,
+                            last_run_unmet_primary=unmet)
+    assert got.kind == hm.KIND_NONE and got.characters is None
+
+    # 5. 冷启动：两个路径都没有 → 不能因为 None == None 就退化命中
+    got = hm.resolve_replay(legacy_record, history_path=None, last_run_path=None,
+                            last_run_characters=snap_roster,
+                            last_run_unmet_primary=unmet)
+    assert got.kind == hm.KIND_NONE and got.characters is None
+
+    # 6. 上一轮保存失败（路径被清空）→ 同样不借，免得配上本轮的竞价
+    got = hm.resolve_replay(legacy_record, history_path="h/a.json",
+                            last_run_path="",
+                            last_run_characters=snap_roster,
+                            last_run_unmet_primary=unmet)
+    assert got.kind == hm.KIND_NONE and got.characters is None
+
+    # 7. 来回切换：先快照后旧记录，标注不能残留
+    got = hm.resolve_replay(new_record)
+    assert got.mode == "PVE" and got.kind == hm.KIND_SNAPSHOT
+    got = hm.resolve_replay(legacy_record, history_path="h/a.json",
+                            last_run_path="h/b.json")
+    assert got.kind == hm.KIND_NONE and got.mode == "" and not got.unmatched_targets
+
+    print("历史回放判定: 自包含/损坏/同源借用/异源/冷启动/保存失败/来回切换 7 场景 OK")
+
+
 def test_alias_coverage():
     """
     别名表必须能解释上游语料里的全部词条写法。
@@ -666,6 +833,8 @@ if __name__ == "__main__":
         test_character_ladder,
         test_panel_progress,
         test_history_manager,
+        test_history_snapshot_roundtrip,
+        test_history_replay_resolution,
         test_alias_coverage,
     ]
     has_own_roster = _OWN_ROSTER.exists()

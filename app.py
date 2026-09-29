@@ -18,8 +18,10 @@ import pandas as pd
 from datetime import datetime
 from typing import List
 
-from history_manager import save_history, list_history, load_history, delete_history
-from models.targets import panel_directive_text
+from history_manager import (
+    save_history, list_history, load_history, delete_history, resolve_replay,
+)
+from models.targets import panel_directive_text, snapshot_targets
 
 # 设置页面
 st.set_page_config(
@@ -148,12 +150,18 @@ with st.sidebar:
             for h in history_list:
                 col_load, col_del = st.columns([6, 1])
                 with col_load:
-                    label = (f"{h['timestamp']}  |  {h['stones']}石  "
-                             f"|  {h['total_bids']}条")
+                    # 模式要写出来：PVE / PVP 的目标词条差别很大，同一份名册
+                    # 会算出两份完全不同的榜，凭时间戳认不出来。
+                    mode_tag = f"{h['mode']}  |  " if h["mode"] else ""
+                    # 旧记录（R1b 之前存的）没有名册快照，点开只有明细天梯
+                    replay_tag = "" if h["has_snapshot"] else "  |  ⚠️ 无角色榜快照"
+                    label = (f"{h['timestamp']}  |  {mode_tag}{h['stones']}石  "
+                             f"|  {h['total_bids']}条{replay_tag}")
                     # key 必须区分加载与删除，否则 Streamlit 会当成同一个控件
                     if st.button(label, key=f"load::{h['filename']}",
                                  use_container_width=True):
                         st.session_state.history_loaded = True
+                        st.session_state.history_path = h["filepath"]
                         st.session_state.history_data = load_history(h["filepath"])
                         st.rerun()
                 with col_del:
@@ -216,16 +224,44 @@ if run_btn:
             st.session_state.stats = get_bid_statistics(bids)
             st.session_state.stones = stones
             st.session_state.credits = credits
+            # 本轮名册与门禁结果的出处。历史记录不含名册，加载历史时名册只能「借」——
+            # 仅当那份历史就是本轮自己存出去的文件时才算同源（见下方加载分支）。
+            # 路径先清空再在保存成功后写入：保存失败时若留着上一轮的路径，
+            # 用户加载上一轮那份文件会被误判成同源，配到本轮的竞价上。
+            st.session_state.last_run_history_path = None
+            st.session_state.last_run_characters = characters
+            st.session_state.last_run_unmet_primary = unmet_primary
+            # 本轮是现算的，不是回放 —— 把上一次加载历史留下的标注清掉，
+            # 否则「本条历史是 PVP 模式」这类说明会粘在现算结果上。
+            st.session_state.history_mode = None
+            st.session_state.history_unmatched = []
+            st.session_state.history_snapshot_error = None
 
             st.success("✅ 计算完成！")
 
-            # 自动保存历史
+            # 自动保存历史：竞价明细 + 名册/目标/门禁快照，凑成一份可回放的记录
+            # （见 history_manager 模块开头）。角色榜的输入全在里面，所以冷启动
+            # 直接加载这条历史也能重建出一模一样的榜。
             try:
-                saved_path = save_history(bids, stones, credits, len(characters))
-                st.toast("✅ 已自动保存历史记录", icon="💾")
-            except Exception:
-                # st.toast 在 Streamlit <1.30 不可用，降级为 success
-                st.success("💾 已自动保存历史记录")
+                saved_path = save_history(
+                    bids, stones, credits, len(characters),
+                    mode=targets_mode,
+                    roster=characters,
+                    targets=snapshot_targets([c.name for c in characters], targets_mode),
+                    unmet_primary=unmet_primary,
+                )
+                st.session_state.last_run_history_path = saved_path
+            except Exception as e:
+                # 保存失败必须吭声。以前这里把整个 save_history 包进 try，
+                # 失败时会照样打印「已自动保存」—— 那句话是假的，
+                # 而且这条路径还决定了加载历史时能不能借用名册。
+                st.warning(f"⚠️ 历史记录保存失败，本次结果未落盘：{e}")
+            else:
+                try:
+                    st.toast("✅ 已自动保存历史记录", icon="💾")
+                except Exception:
+                    # st.toast 在 Streamlit <1.30 不可用，降级为 success
+                    st.success("💾 已自动保存历史记录")
             
         except json.JSONDecodeError as e:
             st.error(f"❌ JSON 解析失败: {e}")
@@ -438,6 +474,27 @@ if st.session_state.get("history_loaded") and st.session_state.get("history_data
     st.session_state.stats = stats
     st.session_state.stones = data["stones"]
     st.session_state.credits = data["credits"]
+    # 角色榜是 f(名册, 竞价, 门禁) 三输入的函数，三者必须同源（R1a 的教训：
+    # 旧名册配新竞价会渲染出一张看着正常、实际错配的表）。上面换掉的只有
+    # bids，名册与门禁从哪来由 resolve_replay 定 —— 那段决策是纯逻辑，
+    # 放在 history_manager 里，WSL 侧测得动。
+    replay = resolve_replay(
+        data,
+        history_path=st.session_state.get("history_path"),
+        last_run_path=st.session_state.get("last_run_history_path"),
+        last_run_characters=st.session_state.get("last_run_characters"),
+        last_run_unmet_primary=st.session_state.get("last_run_unmet_primary"),
+    )
+    st.session_state.characters = replay.characters
+    st.session_state.unmet_primary = replay.unmet_primary
+    # 这三项是「本条榜从哪来」的标注，只有真读到快照时才有值。
+    # 不覆盖的话，上一条历史的模式说明 / 读取错误会粘在下一条上。
+    st.session_state.history_mode = replay.mode or None
+    st.session_state.history_unmatched = replay.unmatched_targets
+    # 错误要写进 session_state —— 紧跟着就 st.rerun()，此刻画出来的活不过重跑。
+    st.session_state.history_snapshot_error = (
+        f"⚠️ 这份历史记录的快照读不出来，角色培养榜无法重建：{replay.error}"
+        if replay.error else None)
     st.session_state.history_loaded = False  # 避免重复加载
     st.toast(f"📂 已加载历史记录: {data['timestamp']}", icon="📂") if hasattr(st, 'toast') else st.success(f"📂 已加载历史记录: {data['timestamp']}")
     st.rerun()
@@ -496,14 +553,28 @@ if st.session_state.bids is not None:
         "已毕业的角色不列出。"
     )
 
+    # 回放的历史：模式要与侧边栏当前选的一致才不让人误会。榜是按记录自带的
+    # 那份目标（历史当时那个模式）重建的，这里只是把差异说出来。
+    hist_mode = st.session_state.get("history_mode")
+    if hist_mode and hist_mode != targets_mode:
+        st.caption(
+            f"📂 这条历史由 **{hist_mode}** 模式的养成目标算出，"
+            f"与侧边栏当前选的 {targets_mode} 不同 —— 下面是历史当时的结果。"
+        )
+
     saved_characters = st.session_state.get("characters")
     if not saved_characters:
-        # 历史记录只存了 bids，没有 Character 对象。这时**不能**把空名册喂给
-        # 角色榜 —— 它会显示「所有角色已毕业」，而那句话是假的。
-        st.info(
-            "📂 当前显示的是历史记录，其中只保存了竞价明细，没有角色装备快照，"
-            "所以无法生成角色培养榜。重新上传 cn_collect.json 并点「运行计算」即可看到。"
-        )
+        load_error = st.session_state.get("history_snapshot_error")
+        if load_error:
+            st.error(load_error)
+        else:
+            # 没有名册**不能**把空名册喂给角色榜 —— 它会显示「所有角色已毕业」，
+            # 而那句话是假的。宁可显示一段说明。
+            st.info(
+                "📂 这份历史记录是「只存竞价明细」的旧格式，没有角色装备快照，"
+                "所以无法生成角色培养榜。重新上传 cn_collect.json 并点「运行计算」，"
+                "存出的新记录会自带快照，之后加载都能看到角色榜。"
+            )
         char_df = None
     else:
         char_df = build_character_dataframe(
@@ -512,6 +583,13 @@ if st.session_state.bids is not None:
             st.session_state.get("unmet_primary") or {},
             top_n=top_n,
         )
+        replay_unmatched = st.session_state.get("history_unmatched") or []
+        if replay_unmatched:
+            st.caption(
+                f"⚠️ 快照里这 {len(replay_unmatched)} 个角色没有养成目标"
+                f"（与历史当时运行一致，推荐表查无此人）："
+                f"{'、'.join(replay_unmatched)}"
+            )
     if char_df is not None and char_df.empty:
         st.info("🎉 所有角色已毕业，暂无培养动作。")
     elif char_df is not None:

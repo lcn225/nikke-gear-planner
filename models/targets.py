@@ -197,6 +197,89 @@ def load_targets(
 
 
 # ────────────────────────────────────────────────────────────
+# 历史记录自带的目标切片
+#
+# 历史记录要能独立回放角色榜，就得连同「当时用的是哪份目标」一起存 ——
+# 角色榜是 f(名册, 竞价, 门禁) 的函数，少了目标就重建不出来；而改用**当前**
+# 的目标表重建，得到的是「旧名册 × 新目标」，正是 R1a 修掉的那类混源。
+#
+# 存的是**原始切片**而不是解析好的 CharTargets：读回时走同一个 `_char_targets`，
+# 与当时跑计算走的是同一条解析路径。存解析结果等于把解析逻辑抄一份进历史文件，
+# 两边一旦走偏，从文件本身看不出来。
+# ────────────────────────────────────────────────────────────
+
+def snapshot_targets(
+    names: List[str],
+    mode: str,
+    parsed_path: str = PARSED_PATH,
+) -> Dict[str, dict]:
+    """
+    切出这批角色在 mode 下的目标，供历史记录自带。
+
+    只保留 `_char_targets` 真正读的键（`tier` / `scores` / `modes[mode]`），
+    另一个模式不带 —— 历史只回放它当时用的那一次。实测这套切片约 79KB，
+    相对一份约 900KB 的竞价明细是可以接受的代价。
+
+    名册里查无此人的角色**直接不进来**（与当次运行一致：那次也没有目标，
+    加载报告里的「推荐表查无此人」才是报警的地方）。但角色在、模式不在
+    是另一回事 —— 那说明快照文件本身残缺，`load_targets` 当时就会抛错，
+    这里同样抛错，不静默少一条。
+    """
+    path = Path(parsed_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"推荐表快照不存在: {parsed_path}。该文件随仓库分发，"
+            f"若缺失请从仓库重新获取。"
+        )
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "characters" not in data:
+        raise ValueError(
+            f"{parsed_path} 顶层应有 characters 键。"
+            f"该文件是随仓库分发的快照，不要手改。"
+        )
+
+    chars = data["characters"]
+    out: Dict[str, dict] = {}
+    for name in names:
+        ch = chars.get(name)
+        if ch is None:
+            continue
+        if mode not in (ch.get("modes") or {}):
+            raise ValueError(
+                f"{parsed_path} 里 {name} 没有 {mode!r} 模式。"
+                f"可用模式见该文件。"
+            )
+        out[name] = {
+            "tier": ch.get("tier"),
+            "scores": ch.get("scores"),
+            "modes": {mode: ch["modes"][mode]},
+        }
+    return out
+
+
+def load_targets_from_snapshot(snapshot: dict, mode: str) -> Dict[str, CharTargets]:
+    """
+    从历史记录自带的目标切片重建 `{角色名: CharTargets}`。
+
+    `snapshot` 是 `snapshot_targets` 的产物（原样存在历史文件里）。
+    缺 mode 一律抛错：那说明这份切片不是按同一个模式生成的，
+    拿它重建等于给角色榜配错目标 —— 宁可读不出来，也不要一张看着正常的错表。
+    """
+    out: Dict[str, CharTargets] = {}
+    for name, ch in snapshot.items():
+        if mode not in (ch.get("modes") or {}):
+            raise ValueError(
+                f"历史记录自带的目标切片里 {name} 没有 {mode!r} 模式；"
+                f"这条记录可能是别的模式生成的，或文件被改动过。"
+            )
+        out[name] = _char_targets(mode, ch)
+    return out
+
+
+# ────────────────────────────────────────────────────────────
 # 毕业进度（展示用，不参与判定）
 # ────────────────────────────────────────────────────────────
 
