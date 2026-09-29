@@ -3,9 +3,13 @@
 # 冒烟测试。刻意只用 printf + assert，不引 pytest —— 仓库没有测试框架，
 # 加一个依赖不值得。运行：
 #     python3 test/test_new_functions.py
+#
+# **一条失败不终止整轮**：全部跑完再汇总，有失败则退出码非零。
+# 原因见下方 runner 里的注释 —— fail-fast 会让「没报错」和「没执行」长得一样。
 
 import json
 import sys
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -854,7 +858,9 @@ if __name__ == "__main__":
         print(f"   {', '.join(sorted(_NEEDS_SNAPSHOT_TOOLING))}")
         print(f"   （本机保留一份即可恢复）\n")
 
+    passed: list[str] = []
     skipped: list[str] = []
+    failed: list[str] = []
     reasons: set[str] = set()
     for t in tests:
         if t.__name__ in _NEEDS_OWN_ROSTER and not has_own_roster:
@@ -865,11 +871,32 @@ if __name__ == "__main__":
             skipped.append(t.__name__)
             reasons.add("缺快照生成工具")
             continue
-        t()
+        try:
+            t()
+        except Exception:
+            # 单条失败**不能**终止整轮。fail-fast 在这里是有害的：排在后面的测试
+            # 一起被跳过之后，「没报错」与「根本没执行」在输出里长得一模一样 ——
+            # 2026-09-29 `test_roster_loader` 因名册在长而失败时，它后面的 9 条
+            # （含当时刚加的两条历史回放测试）就是这么静默消失的，看起来像通过。
+            # 回溯当场打出来，保持与测试进度的先后顺序；末尾再汇总一次名单。
+            failed.append(t.__name__)
+            print(f"❌ {t.__name__} 失败：")
+            traceback.print_exc()
+        else:
+            passed.append(t.__name__)
         print()
 
-    passed = len(tests) - len(skipped)
+    print("─" * 64)
     if skipped:
-        print(f"✅ {passed} 项通过 / ⏭️  {len(skipped)} 项跳过（{'、'.join(sorted(reasons))}）")
+        print(f"⏭️  跳过 {len(skipped)} 项（{'、'.join(sorted(reasons))}）："
+              f"{', '.join(skipped)}")
+    if failed:
+        print(f"❌ 失败 {len(failed)} 项：{', '.join(failed)}")
+        print(f"汇总：✅ {len(passed)} 通过 / ⏭️  {len(skipped)} 跳过 / "
+              f"❌ {len(failed)} 失败")
+        sys.exit(1)
+    if skipped:
+        print(f"✅ {len(passed)} 项通过 / ⏭️  {len(skipped)} 项跳过"
+              f"（{'、'.join(sorted(reasons))}）")
     else:
-        print(f"✅ {len(tests)} 项全部通过")
+        print(f"✅ {len(passed)} 项全部通过")
