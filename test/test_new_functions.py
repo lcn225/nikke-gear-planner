@@ -29,12 +29,14 @@ from engine.probability import expected_cost_to_achieve_targets
 
 EPS = 1e-9
 
-# 真实名册属个人数据，不入库（见 .gitignore）。下面三条测试钉的是**这份名册**的
-# 具体数字（52 角色 / 112 T10 / 247 词条），缺了就大声跳过 —— 不换成
-# input/cn_collect.sample.json：样例数字对不上，换过去只会变成一串看不懂的
-# 断言失败，比直接说「缺文件」更难排查。放一份自己的名册即可恢复这三条。
+# 真实名册属个人数据，不入库（见 .gitignore）。下面这几条测试要的是**一份真实的
+# 名册**（真实装备、真实档位分布、真实门禁），缺了就大声跳过 —— 不换成
+# input/cn_collect.sample.json：那 10 个角色凑不出这几条要覆盖的形态，
+# 换过去只会变成一串看不懂的断言失败，比直接说「缺文件」更难排查。
+# 放一份自己的名册即可恢复。
 _OWN_ROSTER = Path(__file__).resolve().parent.parent / "input" / "cn_collect.json"
-_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder"}
+_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder",
+                     "test_panel_progress"}
 
 # 下面这条测试钉的是**快照生成侧**的行为（别名表能否解释全部语料写法），
 # 它依赖的工具不在仓库里。缺工具就大声跳过 —— 不删掉：在本机保留一份即可
@@ -160,48 +162,40 @@ def test_build_char_summary():
 
 def test_roster_loader():
     """
-    上游名册读入。逐项对齐 input/数据说明.md 里写死的数字 ——
-    那些数字是文档作者人工数出来的，对不上就说明读法跑偏了。
+    上游名册读入。
+
+    **刻意不钉这份名册的绝对数字**（角色数、T10/T9 槽数、词条条数）—— 那是账号
+    现状，升一件装备就变。钉住它只会制造噪音：假失败会把真失败埋掉（2026-10-05
+    就是这么挂的：`t10_slots == 112`，而账号早已升到 117）。
+
+    这里只断言**任何合法名册都必须成立的关系式**，外加「这份名册本身干净」。
+    语义规则（T9/T10 怎么分、小数→百分点→档位、占位符不占词条、脏数据留空报警）
+    由下面的合成用例守 —— 那才是与具体数据无关的守法人。
+
+    绝对数字仍然打印出来：对账靠人眼，不靠断言。
     """
     from engine.roster_loader import load_roster
 
     r = load_roster("input/cn_collect.json")
 
-    # 52 角色 / 208 槽 = 112 T10 + 96 T9 / 247 条真实词条 + 89 个「未获得效果」
-    assert len(r.characters) == 52, len(r.characters)
-    assert r.t10_slots == 112, r.t10_slots
-    assert r.t9_slots == 96, r.t9_slots
-    assert r.buff_lines == 247, r.buff_lines
-    assert r.empty_placeholders == 89, r.empty_placeholders
     assert r.skipped == [], r.skipped
 
-    # 小数 → 百分比 + 档位反查：上游 0.1181 = 11.81% = Tier 11
-    alice = next(c for c in r.characters if c.name == "爱丽丝")
-    head = alice.gears["头"].lines
-    assert head[0].buff_type == "攻击力增加" and head[0].tier == 10, head[0]
-    assert abs(head[0].value_pct - 11.11) < 1e-9, head[0].value_pct
-    assert head[2].tier == 11 and abs(head[2].value_pct - 11.81) < 1e-9, head[2]
+    # 恒等式 1：每个已解析角色恒有 4 个槽，每槽必计且只计一次
+    # （parse_roster 遍历固定的 GEAR_SLOTS，槽内 T9/T10 二选一 +1，无第三分支）
+    assert r.t10_slots + r.t9_slots == 4 * len(r.characters), \
+        (r.t10_slots, r.t9_slots, len(r.characters))
 
-    # 词条位不是顺序填充（XEX 形态 21 个槽）—— 爱丽丝 脚 是 [有, 有, 空]
-    foot = alice.gears["脚"].lines
-    assert foot[0].buff_type == "暴击率增加" and foot[1].buff_type == "蓄力伤害增加"
-    assert foot[2].is_empty
+    # 这份名册是干净的。**这不是读法断言** —— 它若失败，是采集/上游的数据有问题，
+    # 该去看 issues 内容修数据，而不是回来改解析。「留空 + 报警，重抓自愈」是既定政策，
+    # 曾经的「白雪公主 头第2条 数值为 null」就是 2026-09-25 这样被上游补齐的。
+    assert r.issues == [], \
+        "名册有数据异常（采集/上游问题，不是读法跑偏）: " + "; ".join(
+            f"{i.character}/{i.slot}#{i.line_index} {i.kind}" for i in r.issues)
 
-    # T9 整槽 → 3 个空槽，不是「T10 但没词条」
-    queen = next(c for c in r.characters if c.name == "QUEEN（真）")
-    assert queen.gears["甲"].empty_slot_count() == 3, queen.gears["甲"]
-    assert queen.gears["甲"].lines[0].buff_type == ""
-
-    # 「未获得效果」占位符 → 空槽（它是 T10 的证据，但不占词条）
-    drake = next(c for c in r.characters if c.name == "德雷克")
-    assert drake.gears["头"].lines[1].is_empty, drake.gears["头"].lines[1]
-    assert drake.gears["头"].count_buff("攻击力增加") == 1
-
-    # 当前这份上游数据是干净的（0 处异常）。
-    # 曾经的「白雪公主 头第2条 数值为 null」已于 2026-09-25 被上游补齐 ——
-    # 这正是「留空 + 报警，重抓自愈」政策预期的结果。脏数据的**处理逻辑**
-    # 由下面的合成用例守住，不依赖真实数据恰好脏着。
-    assert r.issues == [], r.issues
+    # 恒等式 2：T10 槽恒 3 条（条数≠3 在解析时直接抛错），干净数据下每条非「真词条」
+    # 即「占位符」。所以它以「issues 为空」为前提 —— 上面先断言了。
+    assert r.buff_lines + r.empty_placeholders == 3 * r.t10_slots, \
+        (r.buff_lines, r.empty_placeholders, r.t10_slots)
 
     # 没接推荐表 → 不编造默认目标（targets 为 None），且如实在报告里标出来
     assert r.targets_attached is False
@@ -266,6 +260,27 @@ def test_roster_dirty_data_handling():
     assert issue.kind == "缺数值", issue.kind
     assert c.gears["头"].lines[0].is_empty, "脏数据条应留空，不能猜一个档位填上"
 
+    # XEX 形态：第 1、3 条有词条，**第 2 条空**。本用例其余各槽都是 [有, 空, 空]，
+    # 中间空位从来没被测过 —— 而这正是文档第五节强调的「3 条词条要按集合读，
+    # 别假设它们紧凑填在前 N 位」；读错就会把 2 条词条算成 1 条。
+    xex = {"角色": [{
+        "姓名": "XEX形态", "战力": 1,
+        "头": {"等级": 2, "词条": [
+            {"名称": "攻击力增加", "数值": 0.09},
+            {"名称": "未获得效果", "数值": 0},
+            {"名称": "最大装弹数增加", "数值": 0.3195}]},
+        "甲": {"等级": None, "词条": [{"名称": None, "数值": None}] * 3},
+        "手": {"等级": None, "词条": [{"名称": None, "数值": None}] * 3},
+        "脚": {"等级": None, "词条": [{"名称": None, "数值": None}] * 3},
+    }]}
+    rx = parse_roster(xex)
+    head_xex = rx.characters[0].gears["头"]
+    assert rx.buff_lines == 2, rx.buff_lines          # 中间的空洞不占词条，但也不吞掉第 3 条
+    assert head_xex.empty_slot_count() == 1, head_xex
+    assert head_xex.count_buff("攻击力增加") == 1
+    assert head_xex.count_buff("最大装弹数增加") == 1
+    assert head_xex.lines[1].is_empty and not head_xex.lines[2].is_empty
+
     # 非标准词条名必须抛错（命名铁律），不能静默跳过
     bad = {"角色": [dict(fake["角色"][0], 头={"等级": 0, "词条": [
         {"名称": "攻刃", "数值": 0.1181},
@@ -279,7 +294,7 @@ def test_roster_dirty_data_handling():
         raise AssertionError("非标准词条名应当抛 KeyError")
 
     print(f"脏数据: 留空+报警 1 处 | T9/T10 分开 | 空占位 {res.empty_placeholders} | "
-          f"非标准名已拒绝")
+          f"XEX 中间空位不占词条 | 非标准名已拒绝")
 
 
 def test_targets_snapshot():

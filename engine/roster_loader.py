@@ -152,7 +152,7 @@ def _parse_slot(
         counts["t9"] = 1
         level = raw_slot.get(KEY_LEVEL)
         if level is None:
-            # 上游对 T9 槽不给等级（96/96）。按 Lv0 起算是既定决定，
+            # 上游对 T9 槽不给等级。按 Lv0 起算是既定决定，
             # 但要计数报警 —— 它会让「升级」竞价显得比实际更划算。
             counts["level_unknown"] = 1
             level = 0
