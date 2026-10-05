@@ -37,6 +37,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import SHADOW_PRICE_LAMBDA, TIER_WEIGHT_Q, tier_weight
+from console_io import install_console_fallback
 from engine.bidding_engine import (
     GlobalBiddingEngine,
     build_character_ladder,
@@ -91,6 +92,10 @@ def _prompt_inventory(stones: int | None, credits: int | None) -> tuple[int, int
 
 
 def main():
+    # 最先装：下面每一段输出都带 emoji，重定向/管道下编码是 GBK，
+    # 没有这层降级时 `print("❌ 加载失败")` 自己就会抛 UnicodeEncodeError。
+    install_console_fallback()
+
     opts = _parse_args(sys.argv[1:])
     print(BANNER)
 

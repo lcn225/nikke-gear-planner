@@ -18,10 +18,15 @@ import pandas as pd
 from datetime import datetime
 from typing import List
 
+from console_io import install_console_fallback
 from history_manager import (
     save_history, list_history, load_history, delete_history, resolve_replay,
 )
 from models.targets import panel_directive_text, snapshot_targets
+
+# 页面里的 emoji 走 markdown 到浏览器，不受影响；要救的是引擎打给**终端**的
+# 那些警告（名册加载、物理参数缺失…）—— 终端一旦被重定向就成了 GBK。
+install_console_fallback()
 
 # 设置页面
 st.set_page_config(

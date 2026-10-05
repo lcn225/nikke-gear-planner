@@ -8,6 +8,7 @@
 # 原因见下方 runner 里的注释 —— fail-fast 会让「没报错」和「没执行」长得一样。
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import HARD_ANIM_SEC, INSTANT_CHARGE_LINE
+from console_io import HANDLER_NAME, install_console_fallback
 from engine.damage_model import (
     CharSummary,
     build_char_summary,
@@ -810,9 +812,14 @@ def test_alias_coverage():
     """
     import subprocess
     repo = Path(__file__).resolve().parent.parent
+    # 两端的编码必须钉死成同一个。不钉的话父进程按 locale 解码（中文 Windows
+    # 是 GBK），子进程的输出编码却由 PYTHONIOENCODING / 控制台代码页决定 ——
+    # 两边一致与否全看环境，这个测试的成败就成了环境问题（实测：本机不带
+    # PYTHONIOENCODING 跑通过、带上 UTF-8 反而必挂）。显式指定，与 locale 无关。
     r = subprocess.run(
         [sys.executable, "verify_alias_coverage.py"],
-        cwd=repo, capture_output=True, text=True,
+        cwd=repo, capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
     if r.returncode != 0:
         print(r.stdout)
@@ -821,7 +828,40 @@ def test_alias_coverage():
     print(" | ".join(tail))
 
 
+def test_console_fallback():
+    """
+    控制台编码降级。守的是「报错时不会再把自己打死」——
+    GBK 管道下 `print("❌ …失败")` 曾抛 UnicodeEncodeError，异常从 except
+    逃出去、整轮中止，排在后面的测试一个都不跑，还不留任何痕迹。
+
+    直接测处理器本身：把 errors= 指到它，让 CPython 在编码失败时回调。
+    """
+    install_console_fallback()
+
+    def degrade(s: str) -> str:
+        return s.encode("gbk", HANDLER_NAME).decode("gbk")
+
+    # 状态标记 → 语义等价的 ASCII，降级后仍要分得清谁是谁
+    assert degrade("✅ 通过") == "[OK] 通过"
+    assert degrade("❌ 失败") == "[FAIL] 失败"
+    assert degrade("⚠️ 警告") == "[WARN] 警告"
+    # 变体选择符必须跟着基准字符一起吞掉，不能拖出第二个占位符
+    assert degrade("⏭️ 跳过") == "[SKIP] 跳过"
+    # 装饰性 emoji → 看得见的占位符，而不是让字符消失
+    assert degrade("🏆 角色培养榜") == "[*] 角色培养榜"
+    # GBK 本来就编得出来的（箭头、制表符、≥）一个字节都不许动
+    assert degrade("→ 80%≥60% ╔═╗") == "→ 80%≥60% ╔═╗"
+
+    print("控制台降级: 状态标记 / 变体选择符 / 装饰图标 / 保真 均 OK")
+
+
 if __name__ == "__main__":
+    # 整个 runner 的输出都带 emoji，而失败报告里的 ❌ 就在异常处理路径上。
+    # GBK 管道（重定向、capture_output、CI）下没有这层降级，一条测试失败
+    # 就会在打印报告时抛 UnicodeEncodeError，异常从 except 逃出去、整轮中止 ——
+    # 那正是下面这段「一条失败不终止整轮」要防的事。
+    install_console_fallback()
+
     print(f"常数: 硬直动画={HARD_ANIM_SEC}s, 秒蓄判定线={INSTANT_CHARGE_LINE}\n")
     tests = [
         test_physical_config,
@@ -840,6 +880,7 @@ if __name__ == "__main__":
         test_history_snapshot_roundtrip,
         test_history_replay_resolution,
         test_alias_coverage,
+        test_console_fallback,
     ]
     has_own_roster = _OWN_ROSTER.exists()
     has_tooling = all(p.exists() for p in _SNAPSHOT_TOOLING_MARKERS)
