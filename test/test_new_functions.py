@@ -35,8 +35,7 @@ EPS = 1e-9
 # 换过去只会变成一串看不懂的断言失败，比直接说「缺文件」更难排查。
 # 放一份自己的名册即可恢复。
 _OWN_ROSTER = Path(__file__).resolve().parent.parent / "input" / "cn_collect.json"
-_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder",
-                     "test_panel_progress"}
+_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder"}
 
 # 下面这条测试钉的是**快照生成侧**的行为（别名表能否解释全部语料写法），
 # 它依赖的工具不在仓库里。缺工具就大声跳过 —— 不删掉：在本机保留一份即可
@@ -434,12 +433,112 @@ def test_tier_weighting():
           f"q={TIER_WEIGHT_Q}")
 
 
+# ── 合成名册（R4）────────────────────────────────────────────
+# 「展开详情 / 毕业进度」的语义断言，黄金值由本文件写死，不钉真实名册的具体件数。
+# 真实名册升一件装备、目标表改一版就可能让这些数字过期 —— 挂的是数据不是代码，
+# 假失败会把真失败埋掉（`test_roster_loader` 的 `t10_slots == 112` 就是这么烂的）。
+# 换成合成输入后，数字对不上只能是代码错。
+
+def _synthetic_roster():
+    """
+    一名角色、四件装备：优越 4 件 / 攻击 3 件 / 装弹 2 件。
+    目标下限都设成 4，于是三档期望值正好覆盖 primary_progress 的
+    「达标（4/4）/ 未达标（3/4）/ 未达标（2/4）」三种形态。
+    """
+    from engine.roster_loader import parse_roster
+    from models.targets import CharTargets, TargetSpec
+    from engine.bidding_engine import BidEntry
+
+    def slot(*lines):
+        return {"等级": 0, "词条": [{"名称": n, "数值": v} for n, v in lines]}
+
+    fake = {"角色": [{
+        "姓名": "合成主力", "战力": 1,
+        "头": slot(("优越代码伤害增加", 0.0954), ("攻击力增加", 0.1181), ("最大装弹数增加", 0.3195)),
+        "甲": slot(("优越代码伤害增加", 0.0954), ("攻击力增加", 0.1181), ("最大装弹数增加", 0.3195)),
+        "手": slot(("优越代码伤害增加", 0.0954), ("攻击力增加", 0.1181), ("未获得效果", 0)),
+        "脚": slot(("优越代码伤害增加", 0.0954), ("未获得效果", 0), ("未获得效果", 0)),
+    }]}
+
+    char = parse_roster(fake).characters[0]
+    char.targets = CharTargets(
+        mode="PVE",
+        primary=[
+            TargetSpec(buff="优越代码伤害增加", count=4, count_kind="*4"),
+            TargetSpec(buff="攻击力增加", count=4, count_kind="*4"),
+            TargetSpec(buff="最大装弹数增加", count=4, count_kind="*4"),
+        ],
+        panel={"优越代码伤害增加": 20.0, "最大装弹数增加": 200.0},
+        tier="0",
+    )
+
+    bids = [BidEntry(character_name="合成主力", action_type="洗词条", sort_score=s)
+            for s in (7.5, 3.0, 1.2)]
+    # 别的角色的高分候选 —— 用来验证详情只取本角色的候选，不会串行
+    bids.append(BidEntry(character_name="别的角色", action_type="洗词条", sort_score=99.0))
+    return char, [char], bids, {"合成主力": ["攻击力增加"]}
+
+
+def test_character_detail_synthetic():
+    """
+    展开详情的语义断言，**用合成名册**。
+
+    语义是原先钉在真实名册上的那些（拉毗优越 4/4、皇冠装弹 3 件、候选 N 条）：
+    件的算法（按件计数、比下限）、面板差值、候选过滤与降序，全部保留，
+    只是黄金值从「我这本账号」换成了写死的输入。
+    """
+    from engine.bidding_engine import build_character_detail
+    from models.character import Character
+
+    char, characters, bids, unmet = _synthetic_roster()
+
+    det = build_character_detail("合成主力", characters, bids, unmet)
+
+    # 核心词条：按「全套 4 件里该词条占有几件」比目标下限
+    prim = [(x["buff"], x["have"], x["need"], x["done"]) for x in det["primary"]]
+    assert prim == [
+        ("优越代码伤害增加", 4, 4, True),
+        ("攻击力增加", 3, 4, False),
+        ("最大装弹数增加", 2, 4, False),
+    ], prim
+
+    # 门禁结果原样带进来，不在这里重算
+    assert det["unmet"] == ["攻击力增加"], det["unmet"]
+
+    # 面板：have 是装备求和，gap 是缺口（超了截到 0），按目标总量降序
+    panel = {x["buff"]: x for x in det["panel"]}
+    assert [x["buff"] for x in det["panel"]] == ["最大装弹数增加", "优越代码伤害增加"], det["panel"]
+    assert panel["最大装弹数增加"]["have"] == 63.9, panel["最大装弹数增加"]
+    assert panel["最大装弹数增加"]["gap"] == 136.1, panel["最大装弹数增加"]
+    assert panel["最大装弹数增加"]["done"] is False, panel["最大装弹数增加"]
+    assert panel["优越代码伤害增加"]["have"] == 38.16, panel["优越代码伤害增加"]
+    assert panel["优越代码伤害增加"]["gap"] == 0.0, panel["优越代码伤害增加"]
+    assert panel["优越代码伤害增加"]["done"] is True, panel["优越代码伤害增加"]
+
+    # 候选动作：只取该角色的，且按排序分降序 —— 别的角色那 99.0 不能串进来
+    acts = det["actions"]
+    assert det["n_actions"] == len(acts) == 3, det["n_actions"]
+    assert all(b.character_name == "合成主力" for b in acts), acts
+    ss = [b.sort_score for b in acts]
+    assert ss == [7.5, 3.0, 1.2], ss
+
+    # 没接目标 / 查无此人 → 空 dict（渲染层据此提示，而不是崩）
+    untargeted = Character(name="没接目标")
+    assert build_character_detail("没接目标", characters + [untargeted], bids, unmet) == {}
+    assert build_character_detail("不存在的人", characters, bids, unmet) == {}
+
+    print(f"展开详情(合成): primary 3 项（1 达标 / 2 未达标）| 面板 2 项 | "
+          f"候选 {det['n_actions']} 条（已过滤并降序）")
+
+
 def test_character_ladder():
     """
     角色培养榜：一角色一行、档位优先。
 
-    这是主视图，排序错了整个工具就失去意义。断言钉住三件事：
-    档位必须严格降序、每个角色只能占一行、已毕业的不出现在榜上。
+    这是主视图，排序错了整个工具就失去意义。断言只钉**引擎的性质** ——
+    行序、去重、毕业过滤、无动作的理由、CLI/GUI 文案一致 ——
+    不钉任何具体角色排第几、某角色有几件词条（那些随账号与目标表变，见 R4）。
+    这种形态需要一份有档位分布的真实名册，故仍依赖 `input/cn_collect.json`。
     """
     from config import tier_rank
     from engine.roster_loader import load_roster_with_targets
@@ -489,22 +588,21 @@ def test_character_ladder():
     assert graduated_in_roster, "本跑没有已毕业角色，这条断言失去意义"
     assert not (set(graduated_in_roster) & set(names)), "已毕业角色仍出现在榜上"
 
-    # 拉毗：小红帽 —— 折算前她在明细里排 #303，角色榜里必须进 T0 组
-    lapi = next(x for x in rows if x.name == "拉毗：小红帽")
-    assert lapi.tier == "0" and lapi.rank <= 5, (lapi.tier, lapi.rank)
+    recs = character_rows_to_records(rows)
+    md = generate_character_ladder_report(rows)
 
-    # 被跳过（缺物理参数）的角色要说明原因，不能显示成「无事可做」
-    queen = next((x for x in rows if x.name == "QUEEN（真）"), None)
-    if queen is not None:
-        assert queen.best is None and "物理" in queen.no_action_reason, queen.no_action_reason
-        assert "物理参数不全" in generate_character_ladder_report(rows)
+    # 没有候选动作的角色必须给出理由，且理由要进报表 —— 不能留白让人以为
+    # 「无事可做」。这里的性质与具体角色无关：不管是谁算不了，都得说清楚。
+    no_action = [x for x in rows if x.best is None]
+    assert no_action, "本跑没有无候选动作的角色，这条断言失去意义"
+    for x in no_action:
+        assert x.no_action_reason, f"{x.name} 没有候选动作却说不出原因"
+        assert x.no_action_reason in md, (x.name, x.no_action_reason)
 
     # ── CLI 与 GUI 必须同文案 ──
     # 两边都从 character_rows_to_records 取，这里断言它们确实一致 ——
     # 否则会出现「CLI 显示 ⏸ 但 GUI 不显示」这种没人会马上发现的偏差。
-    recs = character_rows_to_records(rows)
     assert len(recs) == len(rows), (len(recs), len(rows))
-    md = generate_character_ladder_report(rows)
     for rec in recs:
         assert rec["下一步"] in md, f"{rec['角色']} 的下一步文案在 Markdown 里找不到: {rec['下一步']}"
     # ⏸ 标记要跟着走
@@ -513,71 +611,78 @@ def test_character_ladder():
     for rec in recs:
         assert rec["gated"] == rec["下一步"].startswith("⏸"), rec
 
-    # ── 展开详情（角色榜点开某一行）──
-    det = build_character_detail("拉毗：小红帽", r.characters, bids, e.unmet_primary)
-    # 核心词条：优越 4/4 已达标、攻击 3/4 与装弹 2/4 未达标
-    prim = {x["buff"]: (x["have"], x["need"], x["done"]) for x in det["primary"]}
-    assert prim["优越代码伤害增加"] == (4, 4, True), prim
-    assert prim["攻击力增加"] == (3, 4, False), prim
-    assert prim["最大装弹数增加"] == (2, 4, False), prim
-    # 面板三项，装弹缺口最大
-    panel = {x["buff"]: x for x in det["panel"]}
-    assert panel["优越代码伤害增加"]["done"] is True
-    assert panel["最大装弹数增加"]["gap"] > 140, panel["最大装弹数增加"]
-    # 该角色自己的候选动作必须按顺位降序（展开表直接照这个顺序渲染）
-    ss = [b.sort_score for b in det["actions"]]
-    assert ss == sorted(ss, reverse=True), ss[:5]
-    assert det["n_actions"] == len(det["actions"]) == 19, det["n_actions"]
-
-    # 皇冠：核心词条已达成（3 件 ≥ 下限 2），unmet 为空
-    crown = build_character_detail("皇冠", r.characters, bids, e.unmet_primary)
-    assert crown["unmet"] == [], crown["unmet"]
-    assert crown["primary"][0]["buff"] == "最大装弹数增加"
-    assert crown["primary"][0]["have"] == 3 and crown["primary"][0]["need"] == 2
-
-    # 娜嘉：推荐表判「无需词条」→ primary 空但不是错误；面板方向用记号表达
-    najia = build_character_detail("娜嘉", r.characters, bids, e.unmet_primary)
-    assert najia["primary"] == [] and najia["panel"] == []
-    assert najia["panel_directives"], "定性面板方向不能悄悄丢掉"
-    assert "ANY" in najia["panel_directives"], najia["panel_directives"]
-    # 渲染出来的是本仓库自己的文案，不是上游原话
+    # ── 展开详情是纯函数：目标没声明的，详情里不许凭空冒出来 ──
+    # 逐角色核对 primary 与候选都恰好来自该角色自己的目标与竞价 ——
+    # 钉的是过滤有没有漏、有没有串。与名册内容无关，账号变了照样成立；
+    # 具体件数的语义（4/4 达标、3/4 未达标…）由 test_character_detail_synthetic
+    # 在写死的名册上验证，两边都不依赖真实账号。
     from models.targets import panel_directive_text
-    assert panel_directive_text(najia["panel_directives"])
+    for c in r.characters:
+        if c.targets is None:
+            continue
+        det_c = build_character_detail(c.name, r.characters, bids, e.unmet_primary)
+        expected_buffs = []
+        for t in c.targets.primary:
+            if t.buff not in expected_buffs:
+                expected_buffs.append(t.buff)
+        assert [x["buff"] for x in det_c["primary"]] == expected_buffs, c.name
+        acts = det_c["actions"]
+        assert det_c["n_actions"] == len(acts), (c.name, det_c["n_actions"], len(acts))
+        assert all(b.character_name == c.name for b in acts), c.name
+        ss = [b.sort_score for b in acts]
+        assert ss == sorted(ss, reverse=True), (c.name, ss[:5])
 
-    # 查无此人 → 空 dict（渲染层据此提示，而不是崩）
+    # 定性面板方向（记号）必须原样带进详情并渲染成本仓库文案 —— 不能悄悄丢
+    with_directives = [c for c in r.characters
+                       if c.targets and c.targets.panel_directives]
+    assert with_directives, "本跑没有带面板方向记号的角色，这条断言失去意义"
+    for c in with_directives:
+        det_c = build_character_detail(c.name, r.characters, bids, e.unmet_primary)
+        assert det_c["panel_directives"] == c.targets.panel_directives, c.name
+        assert panel_directive_text(det_c["panel_directives"]), c.name
+
+    # 查无此人 / 没接目标 → 空 dict（渲染层据此提示，而不是崩）
     assert build_character_detail("不存在的人", r.characters, bids, {}) == {}
+    no_target = next(c for c in r.characters if c.targets is None)
+    assert build_character_detail(no_target.name, r.characters, bids, {}) == {}
 
     print(f"角色榜: {len(rows)} 行 | 前 {first_non_t0} 行是 T0 | "
-          f"拉毗：小红帽 #{lapi.rank} | CLI/GUI 文案一致 | 展开详情 OK")
+          f"CLI/GUI 文案一致 | 展开详情逐角色核对 OK")
 
 
 def test_panel_progress():
-    """毕业进度是纯展示，但数字要对得上装备。"""
+    """
+    毕业进度是纯展示，但数字要对得上装备。**用合成名册**（R4）——
+    原先钉的皇冠 141%、爱丽丝缺口 80% 都是我这本账号的现状，升装备即过期。
+    换成写死的输入后，gap/done 算错只能是代码错。
+    """
     from models.targets import panel_progress
-    from engine.roster_loader import load_roster_with_targets
 
-    r = load_roster_with_targets()
-    by_name = {c.name: c for c in r.characters}
+    char, _, _, _ = _synthetic_roster()
+    rows = panel_progress(char, char.targets)
 
-    # 皇冠：面板只要装弹 120%，她实际 141% → 已达标
-    crown = by_name["皇冠"]
-    rows = panel_progress(crown, crown.targets)
-    assert len(rows) == 1 and rows[0]["buff"] == "最大装弹数增加", rows
-    assert rows[0]["done"] is True and rows[0]["gap"] == 0.0, rows
+    # 装弹：装备 31.95%×2 = 63.9 vs 目标 200% → 未达标，缺口 136.1
+    manning = next(x for x in rows if x["buff"] == "最大装弹数增加")
+    assert manning["have"] == 63.9 and manning["want"] == 200.0, manning
+    assert manning["gap"] == 136.1 and manning["done"] is False, manning
 
-    # 爱丽丝：优越代码一条都没有 → 缺口 80%
-    alice = by_name["爱丽丝"]
-    rows = {r_["buff"]: r_ for r_ in panel_progress(alice, alice.targets)}
-    assert rows["优越代码伤害增加"]["have"] == 0.0, rows["优越代码伤害增加"]
-    assert rows["优越代码伤害增加"]["gap"] == 80.0, rows["优越代码伤害增加"]
-    assert rows["蓄力速度增加"]["want"] == 8.5, rows["蓄力速度增加"]
+    # 优越：装备 9.54%×4 = 38.16 超过目标 20% → 已达标，缺口截到 0（不能出负数）
+    youyue = next(x for x in rows if x["buff"] == "优越代码伤害增加")
+    assert youyue["have"] == 38.16 and youyue["done"] is True, youyue
+    assert youyue["gap"] == 0.0, youyue
 
-    # 阿妮斯：反装弹角色，面板里不该出现装弹
-    anis = by_name["阿妮斯：闪耀夏日"]
-    assert "最大装弹数增加" not in anis.targets.panel, anis.targets.panel
+    # 逐行恒等式：gap == max(0, want - have)，done == (have >= want)
+    for x in rows:
+        assert x["gap"] == round(max(0.0, x["want"] - x["have"]), 2), x
+        assert x["done"] == (x["have"] >= x["want"]), x
 
-    print(f"毕业进度: 皇冠已达标 / 爱丽丝 优越 {rows['优越代码伤害增加']['have']:.0f}"
-          f"→{rows['优越代码伤害增加']['want']:.0f}%")
+    # 面板只列目标里声明过的词条 —— 目标没要什么，这里就不该冒出什么
+    # （原先靠「阿妮斯不要求装弹」这条数据事实来钉，现在改由合成目标表达）
+    assert {x["buff"] for x in rows} == set(char.targets.panel), rows
+    assert [x["buff"] for x in rows] == ["最大装弹数增加", "优越代码伤害增加"], rows
+
+    print(f"毕业进度(合成): 装弹 {manning['have']:.1f}→{manning['want']:.0f} "
+          f"缺口 {manning['gap']:.1f} | 优越已达标且缺口截零")
 
 
 def test_history_manager():
@@ -890,6 +995,7 @@ if __name__ == "__main__":
         test_targets_snapshot,
         test_tier_weighting,
         test_character_ladder,
+        test_character_detail_synthetic,
         test_panel_progress,
         test_history_manager,
         test_history_snapshot_roundtrip,
