@@ -113,6 +113,21 @@ class BidEntry:
     # 这样报告里能同时看到「原始 ROI」和「折算后的排序分」，可审计。
     sort_score: float = 0.0
 
+    def action_key(self) -> str:
+        """
+        这条动作的稳定标识：角色 | 部位 | 操作 | 目标组合。
+
+        勾选「已完成」按它记账（见下面「勾选已完成」一节）。
+
+        **不能拿 action_detail 当键**：升级类的详情里不含角色名
+        （`"消耗 20k 信用点强化手部基础攻击面板 (Lv0→Lv1)"`），
+        两个角色同部位同等级就会撞成同一个键。实测本仓 1502 条竞价里
+        action_detail 有 **7 组重复**，而本键 PVE/PVP 两跑都是 0 组。
+        键唯一性由 test_action_key_real_roster / test_done_actions 钉住。
+        """
+        target_str = "+".join(sorted(self.target_set or ()))
+        return f"{self.character_name}|{self.gear_slot}|{self.action_type}|{target_str}"
+
 
 @dataclass
 class TargetState:
@@ -471,6 +486,100 @@ def _add_to_summary(s: CharSummary, buff_name: str, delta: float):
     if buff_name in BUFF_TO_SUMMARY_ATTR:
         attr = BUFF_TO_SUMMARY_ATTR[buff_name]
         setattr(s, attr, getattr(s, attr) + delta)
+
+
+# ── 勾选「已完成」（R2）──
+#
+# 语义：勾上一条 = 「这条建议我已经在游戏里做完了」，然后自己去看下一条。
+# **只打标记，不做状态推演** —— 不扣资源、不套词条、不假设随机结果
+# （理由见 docs/ROADMAP.md 的「讨论中已否决的方案」）。所以勾选不改变任何
+# 竞价数值：明细天梯里该行留在原位（次序不变），角色榜推进到该角色的下一条候选。
+#
+# 「推进到下一条」不需要新算法：build_character_ladder 本来就取该角色
+# sort_score 最高的那条，把已勾的滤掉它自己就取到次高。下面这组函数
+# 是纯函数、不依赖 UI 框架 —— 渲染层只负责把结果画出来。
+
+DONE_LABEL = "已全部勾选完成"
+
+
+def select_bids_for_display(bids: List[BidEntry], top_n: int) -> List[BidEntry]:
+    """
+    屏幕上显示的是哪一段竞价。`top_n <= 0` 表示**全部**
+    （与 generate_unified_ladder_report 的口径一致）。
+
+    单独成函数：勾选是按**行**回写的，行与 bid 必须一一对应，
+    而「取哪一段」这条规则原先在 ui_backend 与报告里各写了一遍
+    —— 早期 `bids[:top_n]` 在 top_n=0 时静默返回空表就是这么来的。
+    """
+    return bids[:top_n] if top_n > 0 else bids
+
+
+def done_flags(bids: List[BidEntry], done_keys: Set[str]) -> List[bool]:
+    """屏幕上每一行「是否已勾」。喂给表格控件的勾选列。"""
+    return [b.action_key() in done_keys for b in bids]
+
+
+def merge_done_flags(
+    bids: List[BidEntry], flags: List[bool], done_keys: Set[str]
+) -> Set[str]:
+    """
+    把表格控件回读的勾选状态并进集合，返回新的集合。
+
+    **只动传进来的这些行**：屏幕上只显示 top_n / 筛选后的那一段，
+    没显示的行不在 `flags` 里，它们的勾选必须原样留着 ——
+    否则用户切一下筛选条件，别的行的勾选就被抹掉了。
+
+    Args:
+        bids: 与 flags 一一对应的竞价（即当前屏幕上显示的那些行）
+        flags: 每行是否勾选
+        done_keys: 已有的勾选集合（本函数不修改它）
+    """
+    if len(bids) != len(flags):
+        raise ValueError(
+            f"行与勾选状态对不上：{len(bids)} 条竞价 vs {len(flags)} 个勾选。"
+            "两者必须一一对应，否则勾选会写到别的行上。"
+        )
+    merged = set(done_keys)
+    for bid, checked in zip(bids, flags):
+        key = bid.action_key()
+        if checked:
+            merged.add(key)
+        else:
+            merged.discard(key)
+    return merged
+
+
+def filter_done_bids(bids: List[BidEntry], done_keys: Set[str]) -> List[BidEntry]:
+    """
+    滤掉已勾选完成的条目 —— 角色榜与展开详情收这个，从而推进到下一条候选。
+
+    只用于**展示**：明细天梯仍要拿全量 bids，已勾的行留在原位。
+    """
+    if not done_keys:
+        return bids
+    return [b for b in bids if b.action_key() not in done_keys]
+
+
+def fully_done_characters(
+    bids: List[BidEntry], done_keys: Set[str]
+) -> Dict[str, str]:
+    """
+    候选动作被**全部**勾掉的角色 → {角色名: 理由}，直接当 build_character_ladder
+    的 `unavailable` 用。
+
+    没有这一条，这些角色在榜上会显示「已无待办动作」—— 一句假话：
+    动作是你自己勾掉的，不是本来就没有。
+    """
+    if not done_keys:
+        return {}
+    all_keys: Dict[str, Set[str]] = {}
+    for b in bids:
+        all_keys.setdefault(b.character_name, set()).add(b.action_key())
+    return {
+        name: DONE_LABEL
+        for name, keys in all_keys.items()
+        if keys and keys <= done_keys
+    }
 
 
 # ── 角色榜 ──

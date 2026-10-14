@@ -15,6 +15,7 @@ from engine.bidding_engine import (
     build_character_detail,
     build_character_ladder,
     character_rows_to_records,
+    select_bids_for_display,
 )
 from engine.roster_loader import RosterParseResult, load_roster, parse_roster
 from models.character import Character
@@ -97,7 +98,9 @@ def format_bids_to_dataframe(
         "洗词条+洗数值": "🟣",
     }
 
-    display_bids = bids[:top_n] if top_n > 0 else bids
+    # 「取哪一段」的口径只有一处定义（engine.bidding_engine），
+    # 勾选是按**行**回写的，行与 bid 必须一一对应。
+    display_bids = select_bids_for_display(bids, top_n)
     rows = []
     for bid in display_bids:
         target_str = "+".join(sorted(bid.target_set)) if bid.target_set else "-"

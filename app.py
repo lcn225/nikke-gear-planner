@@ -45,6 +45,13 @@ from ui_backend import (
     format_bids_to_dataframe,
     get_bid_statistics,
 )
+from engine.bidding_engine import (
+    done_flags,
+    filter_done_bids,
+    fully_done_characters,
+    merge_done_flags,
+    select_bids_for_display,
+)
 
 
 # ────────────────────────────────────────────────────────────
@@ -191,6 +198,16 @@ if "characters" not in st.session_state:
 if "stats" not in st.session_state:
     st.session_state.stats = None
 
+# 勾选「已完成」（R2）。**仅本次会话**：刷新页面 / 关掉浏览器就没了
+# （见 docs/ROADMAP.md 的 R2 实施记录）。存的是 BidEntry.action_key() 的集合。
+if "done_actions" not in st.session_state:
+    st.session_state.done_actions = set()
+# 当前这份结果的身份。换一份结果（重新计算 / 加载另一条历史）就 +1 并清空勾选——
+# 勾选清单与它所属的名册·竞价是绑在一起的，跨源沿用就是 R1a 那类错配。
+# 它同时进表格控件的 key：行集一变就换控件，免得编辑框按行号把勾选回填到别的行上。
+if "run_seq" not in st.session_state:
+    st.session_state.run_seq = 0
+
 
 # ────────────────────────────────────────────────────────────
 # 核心逻辑：运行计算
@@ -241,6 +258,11 @@ if run_btn:
             st.session_state.history_mode = None
             st.session_state.history_unmatched = []
             st.session_state.history_snapshot_error = None
+            # 新的结果 = 新的勾选清单。上一轮的勾选按「我做过哪些动作」记账，
+            # 换一份名册/竞价后同一串键指向的东西可能已经不一样了（如 PVE↔PVP），
+            # 沿用就是混源 —— 宁可清空。
+            st.session_state.done_actions = set()
+            st.session_state.run_seq += 1
 
             st.success("✅ 计算完成！")
 
@@ -305,7 +327,8 @@ def _char_column_config() -> dict:
         "ROI": st.column_config.NumberColumn(format="%.4f"),
         "毕业进度": st.column_config.TextColumn(width="medium"),
         "候选数": st.column_config.NumberColumn(
-            help="该角色有多少条候选动作，这里只显示最优的一条，点行展开看全部"),
+            help="该角色还剩多少条候选动作（已勾选完成的不计）。"
+                 "这里只显示最优的一条，点行展开看全部"),
         "gated": None,     # 内部标记，已并入「下一步」的 ⏸ 前缀
     }
 
@@ -338,8 +361,8 @@ def render_character_ladder(char_df) -> str | None:
     return None if choice == "（不展开）" else choice
 
 
-def render_character_detail(detail: dict, stones_held: int = 0):
-    """角色的展开视图：核心词条达成 + 毕业面板 + 该角色的全部候选动作。"""
+def render_character_detail(detail: dict, stones_held: int = 0, n_checked: int = 0):
+    """角色的展开视图：核心词条达成 + 毕业面板 + 该角色剩余的候选动作。"""
     if not detail:
         st.warning("⚠️ 找不到该角色的详情（历史记录模式下没有角色快照）。")
         return
@@ -347,6 +370,28 @@ def render_character_detail(detail: dict, stones_held: int = 0):
     name = detail["name"]
     tier = detail["tier"]
     st.markdown(f"#### 🔍 {name}" + (f" · T{tier}" if tier else ""))
+
+    # ── 勾选「已完成」（R2）──
+    # 角色榜那一行显示的「下一步」就是 actions[0]（build_character_detail 收到的是
+    # 滤掉已勾的竞价，顺序还是全局排序分的降序，所以第一条就是榜上那条）。
+    # 按钮把它勾掉，然后重跑一次让榜立刻推进 —— 否则本次运行的榜已经画完了，
+    # 要到下一次交互才动，看着像没生效。
+    acts = detail["actions"]
+    if acts:
+        best = acts[0]
+        target_str = "+".join(sorted(best.target_set)) if best.target_set else ""
+        current = f"{best.action_type} {best.gear_slot} {target_str}".strip()
+        if st.button(f"✅ 做完了：{current}",
+                     key=f"done::{name}::{best.action_key()}",
+                     help="在游戏里做完了这条 → 勾掉它，角色榜推进到下一条。"
+                          "只打标记，不重算、不扣资源。"):
+            st.session_state.done_actions = \
+                set(st.session_state.done_actions) | {best.action_key()}
+            st.rerun()
+
+    if n_checked:
+        st.caption(f"☑️ 该角色另有 {n_checked} 条已勾选完成，已从这里移出"
+                   f"（明细天梯里仍看得到，取消勾选即可恢复）。")
 
     unmet = detail["unmet"]
     if unmet:
@@ -384,10 +429,10 @@ def render_character_detail(detail: dict, stones_held: int = 0):
         else:
             st.caption("推荐表未给出该角色的数值面板。")
 
-    st.markdown(f"**全部候选动作（{detail['n_actions']} 条，按顺位排序）**")
-    acts = detail["actions"]
+    st.markdown(f"**剩余候选动作（{detail['n_actions']} 条，按顺位排序）**")
     if not acts:
-        st.caption("该角色当前没有可算的候选动作。")
+        st.caption("该角色当前没有可算的候选动作。"
+                   + ("（都勾选完了。）" if n_checked else ""))
     else:
         adf = format_bids_to_dataframe(acts, stones_held=stones_held, top_n=0)
         st.dataframe(adf, hide_index=True, use_container_width=True,
@@ -405,7 +450,7 @@ def generate_execution_plan(bids: List, stones: int, credits: int, top_n: int = 
     lines.append("")
     
     cumulative_cost = 0.0
-    display_bids = bids[:top_n]
+    display_bids = select_bids_for_display(bids, top_n)
     
     for i, bid in enumerate(display_bids, 1):
         cumulative_cost += bid.equivalent_cost
@@ -492,6 +537,9 @@ if st.session_state.get("history_loaded") and st.session_state.get("history_data
     )
     st.session_state.characters = replay.characters
     st.session_state.unmet_primary = replay.unmet_primary
+    # 换了一份结果，勾选清单跟着换（与上面「重新计算」同一处置）。
+    st.session_state.done_actions = set()
+    st.session_state.run_seq += 1
     # 这三项是「本条榜从哪来」的标注，只有真读到快照时才有值。
     # 不覆盖的话，上一条历史的模式说明 / 读取错误会粘在下一条上。
     st.session_state.history_mode = replay.mode or None
@@ -520,6 +568,13 @@ if st.session_state.bids is not None:
     
     # 重新统计
     filtered_stats = get_bid_statistics(filtered_bids)
+
+    # ── 勾选「已完成」的当前状态（R2）──
+    # 明细天梯喂**全量**：已勾的行留在原位（次序不变），只是标出来。
+    # 角色榜与展开详情喂**滤掉已勾的**：这样它们自动落到该角色的下一条候选，
+    # 查表即可，不重算。
+    done_keys = st.session_state.done_actions
+    remaining_bids = filter_done_bids(bids, done_keys)
     
     # 使用 session_state 的值（支持历史加载覆盖）
     display_stones = st.session_state.get("stones", stones)
@@ -547,6 +602,23 @@ if st.session_state.bids is not None:
         st.caption(" | ".join([f"{label}: {v}" for label, v in zip(type_labels, type_values)]))
     
     st.divider()
+
+    # ── 勾选「已完成」的说明与状态 ──
+    # 勾选**只打标记**：不扣资源、不套词条、不假设随机结果（见 docs/ROADMAP.md
+    # 「讨论中已否决的方案」）。所以这里必须把「它做了什么、活多久」讲清楚，
+    # 免得被当成进度推演。
+    n_done = len(done_keys)
+    if n_done:
+        st.caption(
+            f"☑️ 已勾选 **{n_done}** 条已完成 —— 明细天梯里勾掉的行留在原位，"
+            f"角色榜已推进到各角色的下一条。**仅本次会话**：刷新页面或重新计算会清空。"
+        )
+    else:
+        st.caption(
+            "☑️ 在下方「明细竞价天梯」里勾「已完成」，就能标记「这件事我在游戏里做完了」，"
+            "角色榜会自动推进到该角色的下一条。勾选只打标记、不重算（天梯次序不变），"
+            "且**仅本次会话**：刷新页面或重新计算会清空。"
+        )
 
     # ── 角色培养榜（主视图）──
     # 一行 = 一个角色的下一步。用户的问题是「我现在该把资源用到哪」，
@@ -584,8 +656,11 @@ if st.session_state.bids is not None:
     else:
         char_df = build_character_dataframe(
             saved_characters,
-            bids,                                # 用全量 bids，不受操作类型筛选影响
+            remaining_bids,                      # 已勾选完成的不进榜 → 自动落到下一条
             st.session_state.get("unmet_primary") or {},
+            # 候选被全部勾掉的角色：理由要说是「勾完了」，而不是
+            # build_character_ladder 的默认文案「已无待办动作」—— 那是假话。
+            unavailable=fully_done_characters(bids, done_keys),
             top_n=top_n,
         )
         replay_unmatched = st.session_state.get("history_unmatched") or []
@@ -605,9 +680,14 @@ if st.session_state.bids is not None:
 
         if picked:
             detail = build_character_detail(
-                picked, saved_characters, bids,
+                picked, saved_characters, remaining_bids,
                 st.session_state.get("unmet_primary") or {})
-            render_character_detail(detail, stones_held=display_stones)
+            # 勾掉的那些不在 detail["actions"] 里，但得说一声有多少条，
+            # 否则「候选数变少了」看着像丢了信息。
+            n_checked = sum(1 for b in bids if b.character_name == picked
+                            and b.action_key() in done_keys)
+            render_character_detail(detail, stones_held=display_stones,
+                                    n_checked=n_checked)
 
     st.divider()
 
@@ -616,11 +696,35 @@ if st.session_state.bids is not None:
     st.caption("每一条候选动作。角色榜是它的「按角色聚合」视图。")
 
     df = format_bids_to_dataframe(filtered_bids, stones_held=display_stones, top_n=top_n)
-    
+
     if not df.empty:
-        st.dataframe(
-            df,
+        # 屏幕上这一行对应哪条竞价。与 df 用的是**同一个**取段口径，
+        # 所以按下标一一对应 —— 勾选就是按行回写的，串一行就等于记错账。
+        display_bids = select_bids_for_display(filtered_bids, top_n)
+        edit_df = df.copy()
+        edit_df.insert(0, "已完成", done_flags(display_bids, done_keys))
+        # 已勾的行给个显式标记。编辑框里没法像只读表格那样把行划掉 / 变灰：
+        # Pandas Styler 的样式只对 disabled 列生效，而且给编辑框套 Styler 会让
+        # 控件丢状态（streamlit#6898）—— 拿勾选框本身去换一个变灰效果不划算。
+        # 这里改的只是给控件看的那份副本，导出的 df 原样不含勾选列。
+        if edit_df["已完成"].any():
+            done_rows = edit_df["已完成"].astype(bool)
+            edit_df.loc[done_rows, "详情"] = (
+                "✅ 已完成 · " + edit_df.loc[done_rows, "详情"].astype(str))
+
+        edited = st.data_editor(
+            edit_df,
+            # key 带上「结果身份 + 行集签名」：换个结果、改筛选或改 Top N 都换控件。
+            # 编辑框回读是按行号回填的，行集换了还沿用旧状态就会把勾选写到别的行上。
+            key=f"ladder::{st.session_state.run_seq}::{top_n}::"
+                f"{'|'.join(sorted(action_types))}",
             column_config={
+                "已完成": st.column_config.CheckboxColumn(
+                    "已完成",
+                    help="勾上 = 这件事我已经在游戏里做完了。只是打标记，"
+                         "不重算、不扣资源；这一行留在原位，角色榜会推进到下一条。",
+                    default=False,
+                ),
                 "顺位": st.column_config.NumberColumn(format="%d"),
                 "角色": st.column_config.TextColumn(),
                 "部位": st.column_config.TextColumn(),
@@ -632,10 +736,21 @@ if st.session_state.bids is not None:
                 "警告": st.column_config.TextColumn(),
                 "详情": st.column_config.TextColumn(width="large"),
             },
+            # 除了勾选列，别的都不给改 —— 这里的表格是视图，不是编辑器。
+            disabled=[c for c in edit_df.columns if c != "已完成"],
             hide_index=True,
             use_container_width=True,
             height=min(800, 35 * len(df) + 40)
         )
+
+        merged = merge_done_flags(
+            display_bids, [bool(x) for x in edited["已完成"]], done_keys)
+        if merged != done_keys:
+            st.session_state.done_actions = merged
+            # 角色榜在这张表**上面**、本次已经画完了，不主动重跑就要等下一次交互
+            # 才跟着动（勾了却看着没反应）。重跑一次很便宜：没有引擎计算，
+            # 只是拿新的勾选集合把两张表重画一遍。
+            st.rerun()
     
     # ── ROI 柱状图 ──
     st.subheader("📊 TOP 20 ROI 分布")

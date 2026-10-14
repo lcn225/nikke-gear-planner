@@ -35,7 +35,8 @@ EPS = 1e-9
 # 换过去只会变成一串看不懂的断言失败，比直接说「缺文件」更难排查。
 # 放一份自己的名册即可恢复。
 _OWN_ROSTER = Path(__file__).resolve().parent.parent / "input" / "cn_collect.json"
-_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder"}
+_NEEDS_OWN_ROSTER = {"test_roster_loader", "test_tier_weighting", "test_character_ladder",
+                     "test_action_key_real_roster"}
 
 # 下面这条测试钉的是**快照生成侧**的行为（别名表能否解释全部语料写法），
 # 它依赖的工具不在仓库里。缺工具就大声跳过 —— 不删掉：在本机保留一份即可
@@ -472,8 +473,17 @@ def _synthetic_roster():
         tier="0",
     )
 
-    bids = [BidEntry(character_name="合成主力", action_type="洗词条", sort_score=s)
-            for s in (7.5, 3.0, 1.2)]
+    # 三条候选各有不同的部位 / 目标组合：R2 的勾选按
+    # (角色, 部位, 操作, 目标组合) 记账，全留空就撞成同一个键，勾一条等于勾三条。
+    bids = [
+        BidEntry(character_name="合成主力", gear_slot="头", action_type="洗词条",
+                 target_set={"优越代码伤害增加"}, sort_score=7.5),
+        BidEntry(character_name="合成主力", gear_slot="甲", action_type="洗词条",
+                 target_set={"攻击力增加"}, sort_score=3.0),
+        # 升级类：没有目标组合（target_set 为空），键里那一格为空串
+        BidEntry(character_name="合成主力", gear_slot="手", action_type="升级",
+                 sort_score=1.2),
+    ]
     # 别的角色的高分候选 —— 用来验证详情只取本角色的候选，不会串行
     bids.append(BidEntry(character_name="别的角色", action_type="洗词条", sort_score=99.0))
     return char, [char], bids, {"合成主力": ["攻击力增加"]}
@@ -529,6 +539,118 @@ def test_character_detail_synthetic():
 
     print(f"展开详情(合成): primary 3 项（1 达标 / 2 未达标）| 面板 2 项 | "
           f"候选 {det['n_actions']} 条（已过滤并降序）")
+
+
+def test_done_actions():
+    """
+    勾选「已完成」（R2）：动作身份 + 推进语义 + 回写范围。**全程合成输入。**
+
+    勾选只打标记、不做状态推演，所以这里要钉的是三件事：
+    每行认得准（键唯一）、勾掉后角色榜落到下一条、回写只动屏幕上那几行。
+    """
+    from engine.bidding_engine import (
+        DONE_LABEL, BidEntry, build_character_ladder, done_flags, filter_done_bids,
+        fully_done_characters, merge_done_flags, select_bids_for_display,
+    )
+
+    char, characters, bids, unmet = _synthetic_roster()
+    mine = [b for b in bids if b.character_name == "合成主力"]
+    assert [b.sort_score for b in mine] == [7.5, 3.0, 1.2], mine
+    k1, k2, k3 = (b.action_key() for b in mine)
+
+    # ── 1. 动作身份：键里四样都得在，少一样就会撞 ──
+    assert k1 == "合成主力|头|洗词条|优越代码伤害增加", k1
+    assert k3 == "合成主力|手|升级|", k3        # 升级没有目标组合，那一格空着
+
+    # 升级类的详情里**不含角色名**：两个角色同部位同等级，action_detail
+    # 逐字相同 —— 拿它当键就会把两条动作记成同一条（实测真实名册里 7 组重复）。
+    detail = "消耗 20k 信用点强化手部基础攻击面板 (Lv0→Lv1)"
+    jia = BidEntry(character_name="甲", gear_slot="手", action_type="升级", action_detail=detail)
+    yi = BidEntry(character_name="乙", gear_slot="手", action_type="升级", action_detail=detail)
+    assert jia.action_detail == yi.action_detail, "详情文本居然不一样了，本用例的前提要重看"
+    assert jia.action_key() != yi.action_key(), (jia.action_key(), yi.action_key())
+    # 四样里改任何一样都得换键
+    assert jia.action_key() != BidEntry(
+        character_name="甲", gear_slot="头", action_type="升级").action_key()
+    assert jia.action_key() != BidEntry(
+        character_name="甲", gear_slot="手", action_type="洗词条").action_key()
+
+    # ── 2. 推进：勾掉一条，榜就落到该角色的下一条 ──
+    def ladder_with(done):
+        rows = build_character_ladder(
+            characters, filter_done_bids(bids, done), unmet,
+            unavailable=fully_done_characters(bids, done))
+        row = next(r for r in rows if r.name == "合成主力")
+        return row.best, row.n_actions, row.no_action_reason
+
+    best, n_actions, _ = ladder_with(set())
+    assert (best.sort_score, n_actions) == (7.5, 3), (best.sort_score, n_actions)
+    best, n_actions, _ = ladder_with({k1})
+    assert (best.sort_score, n_actions) == (3.0, 2), (best.sort_score, n_actions)
+    best, n_actions, _ = ladder_with({k1, k2})
+    assert (best.sort_score, n_actions) == (1.2, 1), (best.sort_score, n_actions)
+
+    # 全勾完：理由是「勾完了」，不是引擎默认的「已无待办动作」—— 后者是假话
+    best, n_actions, reason = ladder_with({k1, k2, k3})
+    assert best is None and n_actions == 0, (best, n_actions)
+    assert reason == DONE_LABEL, reason
+    assert fully_done_characters(bids, {k1, k2, k3}) == {"合成主力": DONE_LABEL}
+    # 没勾完 / 别的角色没勾，都不能算「全勾完」
+    assert fully_done_characters(bids, {k1, k2}) == {}
+    assert fully_done_characters(bids, set()) == {}
+
+    # 明细天梯那一路不受影响：滤掉已勾的只会**减少**条目，次序一条不挪
+    remaining = filter_done_bids(bids, {k1, k3})
+    assert [b.sort_score for b in remaining] == [3.0, 99.0], remaining
+
+    # ── 3. 回写：只动屏幕上出现的那几行 ──
+    assert select_bids_for_display(mine, 0) == mine      # top_n<=0 = 全部
+    assert select_bids_for_display(mine, 2) == mine[:2]
+
+    all_done = {k1, k2, k3}
+    shown = select_bids_for_display(mine, 2)             # 屏幕上只有前两行
+    assert done_flags(shown, all_done) == [True, True]
+
+    # 取消屏幕上第一行的勾 → 只有它被取消；屏幕外的 k3 不在 flags 里，
+    # 必须原样留着（切一下筛选条件就把别的行的勾选抹掉，是这条要防的事）
+    merged = merge_done_flags(shown, [False, True], all_done)
+    assert merged == {k2, k3}, merged
+
+    # 往返幂等
+    assert merge_done_flags(shown, done_flags(shown, merged), merged) == merged
+    # 勾回来也认 —— 同样只认屏幕上那两行，屏幕外的 k3 不会被「凭空勾上」
+    assert merge_done_flags(shown, [True, True], {}) == {k1, k2}
+
+    # 行与勾选对不上宁可报错，不能默默错位写账
+    try:
+        merge_done_flags(shown, [True], all_done)
+        raise AssertionError("行数与勾选数不一致时居然没报错")
+    except ValueError:
+        pass
+
+    print(f"勾选已完成(合成): 键唯一 | 推进 7.5→3.0→1.2→{DONE_LABEL} | "
+          f"回写只动屏上 {len(shown)} 行（屏外勾选保留）")
+
+
+def test_action_key_real_roster():
+    """
+    真实名册上，全部竞价的动作键必须**唯一** —— 勾选按它记账，撞键就是记错账
+    （勾一条会连带勾上另一条）。真实名册属个人数据，缺了就跳过。
+    """
+    from engine.roster_loader import load_roster_with_targets
+    from engine.bidding_engine import GlobalBiddingEngine
+
+    total = 0
+    for mode in ("PVE", "PVP"):
+        r = load_roster_with_targets(mode=mode)
+        e = GlobalBiddingEngine(stones_held=300, credits_held=5_000_000)
+        bids = e.run(r.characters)
+        keys = [b.action_key() for b in bids]
+        dup = {k for k in keys if keys.count(k) > 1}
+        assert not dup, f"{mode} 有 {len(dup)} 组撞键，例：{sorted(dup)[:3]}"
+        total += len(keys)
+
+    print(f"动作键(真实名册): PVE+PVP 共 {total} 条竞价，0 组重复")
 
 
 def test_character_ladder():
@@ -996,6 +1118,8 @@ if __name__ == "__main__":
         test_tier_weighting,
         test_character_ladder,
         test_character_detail_synthetic,
+        test_done_actions,
+        test_action_key_real_roster,
         test_panel_progress,
         test_history_manager,
         test_history_snapshot_roundtrip,
